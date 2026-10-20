@@ -27,7 +27,8 @@ impl Default for ClipPlanes {
 
 /// Quaternion camera preserving the useful old `SdlGlScene` controls:
 ///
-/// - local movement is transformed by current orientation
+/// - orientation maps WORLD to VIEW (the original SdlGlScene convention)
+/// - local movement is transformed by the inverse orientation
 /// - look_up/look_right/spin pre-multiply orientation quaternions
 /// - look_at rotates the current forward vector onto the target vector
 #[derive(Debug, Clone)]
@@ -66,21 +67,21 @@ impl SeenCamera {
     }
 
     pub fn right(&self) -> DVec3 {
-        self.orientation * DVec3::X
+        self.orientation.inverse() * DVec3::X
     }
 
     pub fn up(&self) -> DVec3 {
-        self.orientation * DVec3::Y
+        self.orientation.inverse() * DVec3::Y
     }
 
     /// Default camera forward is -Z, matching the old OpenGL camera convention.
     pub fn forward(&self) -> DVec3 {
-        self.orientation * -DVec3::Z
+        self.orientation.inverse() * -DVec3::Z
     }
 
     /// Move in camera coordinates.
     pub fn move_camera_local(&mut self, delta: DVec3) {
-        self.position += self.orientation * delta;
+        self.position += self.orientation.inverse() * delta;
     }
 
     /// Move along the current quaternion-derived camera forward vector.
@@ -166,13 +167,14 @@ impl SeenCamera {
         let yaw_q = DQuat::from_axis_angle(DVec3::Y, yaw);
         let pitch_q = DQuat::from_axis_angle(DVec3::X, pitch);
 
-        // Post-multiply: local-frame rotation. This is the important bit.
-        self.orientation = (self.orientation * yaw_q * pitch_q).normalize();
+        // Invert the camera-to-world increment; stored quaternion is world-to-view.
+        self.orientation = (pitch_q.inverse() * yaw_q.inverse() * self.orientation).normalize();
     }
 
     /// Rotate camera so forward points at `point`.
     pub fn look_at(&mut self, point: DVec3) {
         let to_target = point - self.position;
+        if !to_target.is_finite() || to_target.length_squared() < 1e-24 { return; }
         let target_forward = normalized_or(to_target, self.forward());
         let current_forward = normalized_or(self.forward(), -DVec3::Z);
 
@@ -191,7 +193,7 @@ impl SeenCamera {
             DQuat::from_axis_angle(axis, angle)
         };
 
-        self.orientation = (q * self.orientation).normalize();
+        self.orientation = (self.orientation * q.inverse()).normalize();
     }
 
     /// Legacy pixel orbit wrapper. Uses a unit sphere if the caller does not
@@ -249,9 +251,8 @@ impl SeenCamera {
             .fov_y_degrees
             .to_radians()
             .clamp(1.0e-6, std::f64::consts::PI - 1.0e-6);
-        let aspect = w / h;
         let world_per_pixel_y = 2.0 * camera_distance * (0.5 * fov_y).tan() / h;
-        let world_per_pixel_x = world_per_pixel_y * aspect;
+        let world_per_pixel_x = world_per_pixel_y; // square screen pixels; aspect is already in horizontal FOV
 
         let close_rad_x = world_per_pixel_x / object_radius;
         let close_rad_y = world_per_pixel_y / object_radius;
@@ -317,23 +318,23 @@ impl SeenCamera {
     }
 
     pub fn view_matrix(&self) -> DMat4 {
-        let world_from_camera = DMat4::from_rotation_translation(self.orientation, self.position);
-        world_from_camera.inverse()
+        DMat4::from_quat(self.orientation) * DMat4::from_translation(-self.position)
     }
 
-    pub fn projection_matrix(&self, width: f64, height: f64) -> DMat4 {
-        let aspect = if height.abs() > 1e-9 {
-            width / height
-        } else {
-            1.0
-        };
+    /// OpenGL depth -1..1, matching the original C++ engine.
+    pub fn projection_opengl(&self, width: f64, height: f64) -> DMat4 {
+        DMat4::perspective_rh_gl(self.fov_y_degrees.to_radians(),
+            width.max(1.0) / height.max(1.0), self.clip.near, self.clip.far)
+    }
 
-        DMat4::perspective_rh(
-            self.fov_y_degrees.to_radians(),
-            aspect,
-            self.clip.near,
-            self.clip.far,
-        )
+    /// WebGPU depth 0..1; same lens as OpenGL with explicit depth conversion.
+    pub fn projection_matrix(&self, width: f64, height: f64) -> DMat4 {
+        let gl = self.projection_opengl(width, height);
+        let depth = DMat4::from_cols(
+            glam::DVec4::X, glam::DVec4::Y,
+            glam::DVec4::new(0.0,0.0,0.5,0.0),
+            glam::DVec4::new(0.0,0.0,0.5,1.0));
+        depth * gl
     }
 
     pub fn view_projection_matrix(&self, width: f64, height: f64) -> DMat4 {
@@ -407,5 +408,137 @@ mod quaternion_forward_zoom_tests {
         assert_eq!(camera.orientation, orientation_before);
         assert_eq!(camera.fov_y_degrees, fov_before);
         assert_eq!(camera.clip, clip_before);
+    }
+}
+
+impl SeenCamera {
+    pub fn ray_from_screen(
+        &self,
+        cursor_x: f64,
+        cursor_y: f64,
+        viewport_width: f64,
+        viewport_height: f64,
+    ) -> Option<(DVec3, DVec3)> {
+        if viewport_width <= 1.0
+            || viewport_height <= 1.0
+            || !cursor_x.is_finite()
+            || !cursor_y.is_finite()
+        {
+            return None;
+        }
+
+        let ndc_x = ((cursor_x / viewport_width) * 2.0) - 1.0;
+        let ndc_y = 1.0 - ((cursor_y / viewport_height) * 2.0);
+
+        let aspect = viewport_width / viewport_height;
+        let tan_half_fov = (self.fov_y_degrees.to_radians() * 0.5).tan();
+
+        let local_dir = DVec3::new(ndc_x * aspect * tan_half_fov, ndc_y * tan_half_fov, -1.0);
+
+        if local_dir.length_squared() <= 0.0 {
+            return None;
+        }
+
+        let world_dir = (self.orientation.inverse() * local_dir.normalize()).normalize();
+
+        Some((self.position, world_dir))
+    }
+
+
+    pub fn world_to_view(&self, point: DVec3) -> DVec3 {
+        self.orientation * (point - self.position)
+    }
+    pub fn view_basis_f32(&self) -> ([f32;4],[f32;4],[f32;4]) {
+        let v = |axis: DVec3| { let v=self.orientation*axis; [v.x as f32,v.y as f32,v.z as f32,0.0] };
+        (v(DVec3::X),v(DVec3::Y),v(DVec3::Z))
+    }
+    pub fn projection_with_clip(&self, width:f64, height:f64, near:f64, far:f64) -> DMat4 {
+        let mut camera=self.clone(); camera.set_clip(near,far); camera.projection_matrix(width,height)
+    }
+    pub fn translate_local(&mut self, delta:DVec3) { self.move_camera_local(delta); }
+    pub fn translate_world(&mut self, delta:DVec3) { self.move_world(delta); }
+    pub fn translate_forward(&mut self, distance:f64) { self.move_forward(distance); }
+    pub fn move_xyz_world(&mut self, x:f64,y:f64,z:f64) { self.move_world(DVec3::new(x,y,z)); }
+    pub fn move_dxdydz_camera(&mut self,x:f64,y:f64,z:f64) { self.move_camera_local(DVec3::new(x,y,-z)); }
+    pub fn move_towards_point(&mut self, target:DVec3, distance:f64) {
+        let d=target-self.position; if d.is_finite() && d.length_squared()>0.0 { self.position+=d.normalize()*distance; }
+    }
+    pub fn rotate_towards_point(&mut self, target:DVec3) { self.look_at(target); }
+    pub fn look_at_quat(&mut self, target:DVec3) { self.look_at(target); }
+    pub fn set_follow_view(&mut self, target:DVec3, distance:f64) {
+        self.position=target+DVec3::new(0.0,-distance,distance*0.25); self.look_at(target);
+    }
+    pub fn rotate_around_point(&mut self, target:DVec3, yaw:f64,pitch:f64) { self.orbit_focus_radians(target,yaw,pitch); }
+    pub fn orbit_quat_about_point(&mut self,target:DVec3,yaw:f64,pitch:f64) { self.orbit_focus_radians(target,yaw,pitch); }
+    pub fn rotate_local_axis(&mut self, axis:DVec3, radians:f64) {
+        if axis.is_finite() && axis.length_squared()>0.0 && radians.is_finite() {
+            self.orientation=(DQuat::from_axis_angle(axis.normalize(),-radians)*self.orientation).normalize();
+        }
+    }
+    pub fn rotate_world_axis(&mut self, axis:DVec3, radians:f64) {
+        if axis.is_finite() && axis.length_squared()>0.0 && radians.is_finite() {
+            self.orientation=(self.orientation*DQuat::from_axis_angle(axis.normalize(),-radians)).normalize();
+        }
+    }
+    pub fn roll_about_forward(&mut self, radians:f64) { self.rotate_local_axis(-DVec3::Z,radians); }
+    pub fn normalize_rotation(&mut self) {
+        let n=self.orientation.length_squared();
+        self.orientation=if n.is_finite() && n>1e-24 { self.orientation.normalize() } else { DQuat::IDENTITY };
+    }
+    pub fn rotation_is_unit_quat(&self)->bool { (self.orientation.length_squared()-1.0).abs()<1e-9 }
+    /// Argument is WORLD TO VIEW, never camera-to-world.
+    pub fn set_rotation_quat(&mut self,q:DQuat) { self.orientation=q; self.normalize_rotation(); }
+    pub fn as_xyzw(&self)->[f64;4] { self.orientation.to_array() }
+}
+
+impl SeenCamera {
+    /// Screen projection and apparent size share the exact lens used by mesh drawing.
+    pub fn project_sphere(&self, world:DVec3, radius:f64, width:f64,height:f64)->Option<(f64,f64,f64,f64)> {
+        if width<=0.0 || height<=0.0 {return None;}
+        let view=self.world_to_view(world);let depth=-view.z;
+        if !depth.is_finite() || depth<=self.clip.near || depth>=self.clip.far {return None;}
+        let p=self.projection_matrix(width,height)*view.extend(1.0);
+        let ndc=p.truncate()/p.w;
+        if !ndc.is_finite(){return None;}
+        let diameter=radius.max(0.0)*height/(depth*(self.fov_y_degrees.to_radians()*0.5).tan());
+        Some((ndc.x,ndc.y,depth,diameter))
+    }
+    /// Host supplies scene bounds; Hagi owns framing geometry and orientation.
+    pub fn frame_bounds(&mut self, center:DVec3, radius:f64, direction:DVec3, margin:f64, min_distance:f64,max_distance:f64) {
+        let distance=(radius.max(0.0)*margin/(self.fov_y_degrees.to_radians()*0.5).tan().max(0.01))
+            .clamp(min_distance,max_distance);
+        self.position=center+direction.normalize_or_zero()*distance;
+        self.look_at(center);
+    }
+}
+
+impl ClipPlanes {
+    pub fn bounded(near:f64,far:f64,max_ratio:f64)->Self {
+        let near=if near.is_finite(){near.max(0.001)}else{0.001};
+        let far=if far.is_finite(){far.max(near+1.0).max(near*16.0)}else{near*16.0};
+        Self {near,far:far.min(near*max_ratio.max(1000.0))}
+    }
+    /// Inputs are already view-space center depth and radius. Never transform twice.
+    pub fn from_view_spheres(spheres:impl IntoIterator<Item=(f64,f64)>, fallback:Self,max_ratio:f64)->Self {
+        let mut near=f64::INFINITY;let mut far=0.0_f64;
+        for (depth,radius) in spheres {
+            if !depth.is_finite() || depth<=0.0 || !radius.is_finite(){continue;}
+            let radius=radius.abs().max(1.0);
+            near=near.min((depth-radius*4.0).max(depth*0.25));
+            far=far.max(depth+radius*4.0);
+        }
+        if near.is_finite() && far>0.0 {Self::bounded(near,far,max_ratio)}
+        else {Self::bounded(fallback.near,fallback.far,max_ratio)}
+    }
+    pub fn around_focus(depth:f64,radius:f64,max_ratio:f64)->Self {
+        let near=(depth-radius*8.0).max((depth*0.001).max(0.001));
+        Self::bounded(near,(depth+radius*8.0).max(near*16.0),max_ratio)
+    }
+}
+
+impl SeenCamera {
+    pub fn place_looking_at(&mut self,target:DVec3,offset:DVec3) {self.move_to(target+offset);self.look_at(target);}
+    pub fn animate_orbit(&mut self,target:DVec3,radius:f64,height:f64,angle:f64) {
+        self.place_looking_at(target,DVec3::new(angle.cos()*radius,angle.sin()*radius,height));
     }
 }

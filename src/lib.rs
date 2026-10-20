@@ -13,3 +13,7 @@ pub use camera::{ClipPlanes, SeenCamera};
 pub use input::{CameraCommand, CameraControlMode};
 pub use kinematics::R3Kinematics;
 pub use scene::{SceneObject, SeenSceneController};
+
+pub mod shaders;
+pub mod touch;
+pub mod navigation;
